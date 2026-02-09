@@ -1,0 +1,15 @@
+# WebSocket 客户端
+websockets>=12.0
+# HTTP 登录请求（异步）
+aiohttp>=3.9.0
+
+# Windows UI 自动化 (Cursor 为 Electron，使用 UIA 后端)
+pywinauto>=0.6.8
+
+# 键盘/鼠标模拟（备用方案）
+pyautogui>=0.9.54
+# 剪贴板粘贴（用于输入中文等 Unicode）
+pyperclip>=1.8.2
+
+# 环境变量与配置
+python-dotenv>=1.0.0
