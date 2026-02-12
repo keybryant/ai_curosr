@@ -387,78 +387,130 @@ def _find_and_click_send_button(wnd) -> bool:
         return False
 
 
+def _try_send(wnd) -> str:
+    """
+    尝试多种方式发送已输入的内容，返回成功使用的方法名，失败返回空字符串。
+    策略顺序：
+      1. Enter 键（Cursor Agent/Chat 面板默认发送键）
+      2. 配置热键（如 Ctrl+Enter 等，用户可在 .env 中自定义）
+      3. UIA 查找并点击发送按钮
+    每种方式之间加短暂延迟，避免产生重复发送。
+    """
+    # ── 方法 1: 直接按 Enter ──
+    try:
+        logger.info("_try_send: 尝试方法1 - 按 Enter 发送")
+        pyautogui.press("enter")
+        return "enter"
+    except Exception as e:
+        logger.debug("_try_send: Enter 发送异常: %s", e)
+
+    # ── 方法 2: 配置热键（仅当热键不是单独的 Enter 时才尝试，避免重复） ──
+    send_keys = _parse_hotkey(config.CURSOR_SEND_HOTKEY)
+    if send_keys and send_keys != ["enter"]:
+        try:
+            time.sleep(0.3)
+            logger.info("_try_send: 尝试方法2 - 配置热键 %s -> %s", config.CURSOR_SEND_HOTKEY, send_keys)
+            pyautogui.hotkey(*send_keys)
+            return f"hotkey({config.CURSOR_SEND_HOTKEY})"
+        except Exception as e:
+            logger.debug("_try_send: 配置热键发送异常: %s", e)
+
+    # ── 方法 3: UIA 查找发送按钮并点击 ──
+    if wnd and _pywinauto_ok:
+        try:
+            time.sleep(0.3)
+            logger.info("_try_send: 尝试方法3 - UIA 查找发送按钮")
+            if _find_and_click_send_button(wnd):
+                return "send_button"
+        except Exception as e:
+            logger.debug("_try_send: 点击发送按钮异常: %s", e)
+
+    return ""
+
+
 def write_and_send(text: str, project_id: Optional[str] = None) -> dict[str, Any]:
     """
     往输入框写入内容并发送。
     project_id 指定时在对应工程窗口内操作；否则用上次打开的窗口。
+
+    关键改动：
+    - 粘贴文本后 **不再** 调用 set_focus 重聚焦（Electron 下会导致焦点偏移）
+    - 发送时依次尝试 Enter / 配置热键 / UIA 点击按钮
     """
     if not text:
         return {"ok": False, "error": "内容为空"}
-    if not _pywinauto_ok and not _pyautogui_ok:
-        return {"ok": False, "error": "需要 pywinauto 或 pyautogui"}
+    if not _pyautogui_ok:
+        return {"ok": False, "error": "需要 pyautogui"}
+
     # 是否包含非 ASCII（如中文）→ 必须用剪贴板粘贴
     use_clipboard = any(ord(c) > 127 for c in text)
-    send_keys = _parse_hotkey(config.CURSOR_SEND_HOTKEY)  # 如 ["ctrl", "shift", "enter"]
-    if not send_keys:
-        return {"ok": False, "error": f"无效的发送热键配置: {config.CURSOR_SEND_HOTKEY}"}
+
     try:
+        wnd = None
+
+        # ━━ 阶段1: 聚焦 Cursor 窗口 ━━
         if _pywinauto_ok:
             wnd = _find_cursor_window(project_id)
             if wnd:
-                for ctrl in wnd.descendants():
-                    try:
-                        if ctrl.element_info.control_type not in ("Edit", "Document"):
-                            continue
-                        ctrl.set_focus()
-                        time.sleep(0.25)
-                        if use_clipboard and _pyperclip_ok and _pyautogui_ok:
-                            _paste_text_via_clipboard(text)
-                        else:
-                            if hasattr(ctrl, "set_value"):
-                                ctrl.set_value(text)
-                            elif hasattr(ctrl, "set_edit_text"):
-                                ctrl.set_edit_text(text)
-                            else:
-                                ctrl.type_keys(text.replace("}", "}}").replace("{", "{{"), with_spaces=True)
-                        # 等待内容落盘后，确保输入框保持焦点，再用 Ctrl+Shift+Enter 发送
-                        time.sleep(0.4)
-                        wnd.set_focus()
-                        time.sleep(0.15)
-                        ctrl.set_focus()
-                        time.sleep(0.25)  # 留足时间让焦点稳定到输入框，否则热键可能被其它控件吃掉
-                        logger.info("write_and_send: 即将发送热键 %s -> %s", config.CURSOR_SEND_HOTKEY, send_keys)
-                        if _pyautogui_ok:
-                            pyautogui.hotkey(*send_keys)
-                        else:
-                            # pywinauto type_keys：^=Ctrl +=Shift，主键用 {Enter} 等
-                            mod_map = {"ctrl": "^", "shift": "+", "alt": "%", "win": "win"}
-                            prefix = "".join(mod_map.get(k, "") for k in send_keys[:-1] if k in mod_map)
-                            main = send_keys[-1]
-                            key_str = prefix + (main if len(main) > 1 else main.upper())
-                            if main in ("enter", "return", "tab", "space", "escape"):
-                                key_str = prefix + "{" + main.capitalize() + "}"
-                            ctrl.type_keys(key_str)
-                        return {"ok": True, "method": "uia"}
-                    except Exception:
+                wnd.set_focus()
+                time.sleep(0.3)
+
+        # ━━ 阶段2: 写入文本 ━━
+        written = False
+
+        # 方式 A: 通过 UIA 找到输入控件，聚焦后粘贴/填写
+        if _pywinauto_ok and wnd:
+            for ctrl in wnd.descendants():
+                try:
+                    if ctrl.element_info.control_type not in ("Edit", "Document"):
                         continue
-        if _pyautogui_ok:
+                    ctrl.set_focus()
+                    time.sleep(0.2)
+                    if use_clipboard and _pyperclip_ok:
+                        _paste_text_via_clipboard(text)
+                    else:
+                        if hasattr(ctrl, "set_value"):
+                            ctrl.set_value(text)
+                        elif hasattr(ctrl, "set_edit_text"):
+                            ctrl.set_edit_text(text)
+                        else:
+                            ctrl.type_keys(
+                                text.replace("}", "}}").replace("{", "{{"),
+                                with_spaces=True,
+                            )
+                    written = True
+                    logger.info("write_and_send: 已通过 UIA 写入文本（长度=%d）", len(text))
+                    break
+                except Exception as ex:
+                    logger.debug("write_and_send: UIA 写入控件失败: %s", ex)
+                    continue
+
+        # 方式 B: 纯键盘备用（假设输入框已经有焦点）
+        if not written and _pyautogui_ok:
+            logger.info("write_and_send: UIA 未成功，改用纯键盘写入")
             if use_clipboard and _pyperclip_ok:
-                pyautogui.hotkey("ctrl", "a")
-                time.sleep(0.05)
                 _paste_text_via_clipboard(text)
-                time.sleep(0.15)
             else:
-                pyautogui.hotkey("ctrl", "a")
-                time.sleep(0.05)
                 pyautogui.write(text, interval=0.02)
-            time.sleep(0.4)
-            # 统一用配置的热键发送（Cursor 默认 Ctrl+Shift+Enter），稍等确保焦点在输入区
-            time.sleep(0.2)
-            logger.info("write_and_send: 即将发送热键 %s -> %s (method=keyboard)", config.CURSOR_SEND_HOTKEY, send_keys)
-            pyautogui.hotkey(*send_keys)
-            return {"ok": True, "method": "keyboard"}
-        return {"ok": False, "error": "无法写入输入框（UIA 未找到控件且未使用键盘备用）"}
+            written = True
+
+        if not written:
+            return {"ok": False, "error": "无法写入文本到输入框"}
+
+        # ━━ 阶段3: 发送 ━━
+        # 关键：粘贴后 **不要** 重新 set_focus，焦点已经在输入框内；
+        # 只需等 UI 刷新后直接按键发送
+        time.sleep(0.5)
+
+        method = _try_send(wnd)
+        if method:
+            logger.info("write_and_send: 发送成功, method=%s", method)
+            return {"ok": True, "method": method}
+
+        logger.warning("write_and_send: 所有发送方式均失败")
+        return {"ok": False, "error": "文本已写入但发送失败（Enter / 热键 / 按钮均未生效）"}
     except Exception as e:
+        logger.error("write_and_send: 异常: %s", e, exc_info=True)
         return {"ok": False, "error": str(e)}
 
 

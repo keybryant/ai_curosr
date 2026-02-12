@@ -20,8 +20,9 @@ CURSOR_EXE = os.getenv("CURSOR_EXE", "cursor")
 RECONNECT_INTERVAL = float(os.getenv("RECONNECT_INTERVAL", "5"))
 # 等待 Cursor 窗口/输入框就绪的超时（秒）
 CURSOR_UI_TIMEOUT = int(os.getenv("CURSOR_UI_TIMEOUT", "15"))
-# 发送提示词的热键（Cursor 中发送为 Ctrl+Shift+Enter）
-CURSOR_SEND_HOTKEY = os.getenv("CURSOR_SEND_HOTKEY", "Ctrl+Shift+Enter")
+# 发送提示词的热键（Cursor Agent/Chat 面板默认用 Enter 发送，Shift+Enter 换行）
+# 若你的 Cursor 版本不同，可在 .env 中覆盖，如 CURSOR_SEND_HOTKEY=Ctrl+Enter
+CURSOR_SEND_HOTKEY = os.getenv("CURSOR_SEND_HOTKEY", "Enter")
 # 打开新 Agent 的热键（Cursor 中为 Ctrl+Shift+L）
 CURSOR_OPEN_AGENT_HOTKEY = os.getenv("CURSOR_OPEN_AGENT_HOTKEY", "Ctrl+Shift+L")
 
