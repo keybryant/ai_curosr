@@ -4,11 +4,15 @@
 运行方式: python server_demo.py
 然后运行: python main.py
 再在本终端输入 JSON 命令，例如:
-  {"id":1,"cmd":"create_folder","params":{"path":"test_dir"}}
-  {"id":2,"cmd":"open_cursor","params":{"path":"test_dir"}}
+  {"id":1,"cmd":"create_folder","params":{"path":"test_dir","projectId":"p1","projectName":"我的测试项目"}}
+  {"id":2,"cmd":"open_cursor","params":{"path":"test_dir","projectId":"p1"}}
   {"id":3,"cmd":"get_input_state"}
   {"id":4,"cmd":"write_and_send","params":{"text":"请列出当前目录文件"}}
-  {"id":5,"cmd":"get_result"}
+  {"id":5,"cmd":"open_new_agent"}
+  # 多窗口：用 projectId 区分不同工程窗口，例如：
+  {"id":10,"cmd":"open_cursor","params":{"path":"proj_a","projectId":"p1"}}
+  {"id":11,"cmd":"open_cursor","params":{"path":"proj_b","projectId":"p2"}}
+  {"id":12,"cmd":"write_and_send","params":{"text":"hello","projectId":"p1"}}
 """
 
 import asyncio

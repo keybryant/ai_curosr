@@ -31,21 +31,27 @@ async def handle_command(cmd: str, params: Optional[dict] = None) -> dict[str, A
     try:
         if cmd == "create_folder":
             path = params.get("path", "")
-            result = ctrl.create_folder(path)
+            project_id = params.get("projectId")
+            project_name = params.get("projectName")
+            result = await _run_sync(ctrl.create_folder, path, project_id, project_name)
             return result
         if cmd == "open_cursor":
             path = params.get("path", "")
-            result = await _run_sync(ctrl.open_cursor, path)
+            project_id = params.get("projectId")
+            result = await _run_sync(ctrl.open_cursor, path, project_id)
             return result
         if cmd == "get_input_state":
-            result = await _run_sync(ctrl.get_input_state)
+            project_id = params.get("projectId")
+            result = await _run_sync(ctrl.get_input_state, project_id)
             return result
         if cmd == "write_and_send":
             text = params.get("text", "")
-            result = await _run_sync(ctrl.write_and_send, text)
+            project_id = params.get("projectId")
+            result = await _run_sync(ctrl.write_and_send, text, project_id)
             return result
-        if cmd == "get_result":
-            result = await _run_sync(ctrl.get_result)
+        if cmd == "open_new_agent":
+            project_id = params.get("projectId")
+            result = await _run_sync(ctrl.open_new_agent, project_id)
             return result
         return {"ok": False, "error": f"未知命令: {cmd}"}
     except Exception as e:
@@ -53,31 +59,44 @@ async def handle_command(cmd: str, params: Optional[dict] = None) -> dict[str, A
         return {"ok": False, "error": str(e)}
 
 
+def _response_payload(msg_id: Any, msg_type: str, data: dict, project_id: Optional[str] = None) -> dict:
+    """构造统一响应体，若有 projectId 则一并带上。"""
+    payload = {"id": msg_id, "type": msg_type, "data": data}
+    if project_id is not None:
+        payload["projectId"] = project_id
+    return payload
+
+
 async def process_message(ws, raw: str) -> None:
     """解析一条后端消息，执行命令并回写一条 JSON。"""
+    logger.info("[收到] %s", raw)
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError as e:
-        await ws.send(json.dumps({"type": "error", "data": {"error": f"JSON 解析失败: {e}"}}, ensure_ascii=False))
+        out = json.dumps({"type": "error", "data": {"error": f"JSON 解析失败: {e}"}}, ensure_ascii=False)
+        logger.info("[发送] %s", out)
+        await ws.send(out)
         return
     msg_id = msg.get("id")
     cmd = msg.get("cmd")
-    params = msg.get("params")
+    params = msg.get("params") or {}
+    project_id = params.get("projectId")
     if not cmd:
-        await ws.send(json.dumps({"id": msg_id, "type": "error", "data": {"error": "缺少 cmd"}}, ensure_ascii=False))
+        logger.debug("忽略无 cmd 的消息，不向后台发送错误")
         return
     data = await handle_command(cmd, params)
-    payload = {"id": msg_id, "type": "result", "data": data}
-    await ws.send(json.dumps(payload, ensure_ascii=False))
+    out = json.dumps(_response_payload(msg_id, "result", data, project_id), ensure_ascii=False)
+    logger.info("[发送] %s", out)
+    await ws.send(out)
 
 
 async def run_client():
-    """连接后端 WebSocket：ws://<后端地址>/ws/ai-tool/<projectId>，无需登录与 token。"""
+    """连接后端 WebSocket：ws://<后端地址>/ws/ai-tool，无需登录与 token、无需 projectId。"""
     while True:
         try:
             url = config.get_ws_url()
-            if not config.PROJECT_ID and not config.WS_URL:
-                logger.warning("未配置 CURSOR_PROJECT_ID 或 CURSOR_WS_URL，%s 秒后重试...", config.RECONNECT_INTERVAL)
+            if not url or not url.replace("ws://", "").replace("wss://", "").strip():
+                logger.warning("未配置 CURSOR_WS_URL 或 CURSOR_BACKEND_ADDRESS，%s 秒后重试...", config.RECONNECT_INTERVAL)
                 await asyncio.sleep(config.RECONNECT_INTERVAL)
                 continue
             logger.info("正在连接 %s ...", url)

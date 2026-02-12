@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-本地 Cursor 控制器：创建文件夹、用 Cursor 打开目录、监控/写入输入框、监控结果。
+本地 Cursor 控制器：创建文件夹、用 Cursor 打开目录、监控/写入输入框。
 依赖：pywinauto (UIA)、pyautogui（备用）、config。
 """
 
+import json
 import logging
 import subprocess
 import sys
@@ -17,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 # 方案 1：优先操作“我开的那个”窗口。Cursor 为 Electron，启动进程会退出，故用“上次打开的文件夹名”匹配窗口标题
 _last_opened_folder_name: Optional[str] = None
+# projectId -> 该工程对应窗口的文件夹名（用于多窗口时按 projectId 定位）
+_project_windows: dict[str, str] = {}
 
 
 def _resolve_cursor_exe() -> str:
@@ -60,21 +63,40 @@ except ImportError:
     pass
 
 
-def create_folder(path: str) -> dict[str, Any]:
-    """创建文件夹（含多级）。路径可为绝对或相对 config.PROJECT_ROOT。"""
+def create_folder(
+    path: str,
+    project_id: Optional[str] = None,
+    project_name: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    创建文件夹（含多级）。路径可为绝对或相对 config.PROJECT_ROOT。
+    若传入 project_id，创建成功后在目录下建 .project 子目录，并在其中写入 project.json，
+    内容为 {"projectId": "...", "projectName": "..."}；projectName 未传时用目录名。
+    """
     try:
         p = Path(path)
         if not p.is_absolute():
             p = config.PROJECT_ROOT / p
         p.mkdir(parents=True, exist_ok=True)
-        return {"ok": True, "path": str(p.resolve())}
+        resolved = str(p.resolve())
+
+        if project_id is not None and project_id != "":
+            dot_project = p / ".project"
+            dot_project.mkdir(parents=True, exist_ok=True)
+            name = (project_name or p.name) if project_name is not None else p.name
+            project_json = dot_project / "project.json"
+            data = {"projectId": project_id, "projectName": name}
+            project_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info("已写入 %s: projectId=%s, projectName=%s", project_json, project_id, name)
+
+        return {"ok": True, "path": resolved}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
-def open_cursor(folder_path: str) -> dict[str, Any]:
-    """用 Cursor 打开指定文件夹。使用 config.CURSOR_EXE（会经 _resolve_cursor_exe 解析）。"""
-    global _last_opened_folder_name
+def open_cursor(folder_path: str, project_id: Optional[str] = None) -> dict[str, Any]:
+    """用 Cursor 打开指定文件夹。若传 project_id 则登记到 projectId->窗口 映射表，便于后续按 projectId 操作对应窗口。"""
+    global _last_opened_folder_name, _project_windows
     try:
         p = Path(folder_path)
         if not p.is_absolute():
@@ -82,7 +104,11 @@ def open_cursor(folder_path: str) -> dict[str, Any]:
         if not p.is_dir():
             return {"ok": False, "error": f"目录不存在: {p}"}
         path_str = str(p.resolve())
-        _last_opened_folder_name = p.name  # 用于后续按窗口标题匹配“我开的那个”
+        folder_name = p.name
+        _last_opened_folder_name = folder_name
+        if project_id:
+            _project_windows[project_id] = folder_name
+            logger.info("登记 projectId=%s -> 窗口(文件夹名)=%s", project_id, folder_name)
         cursor_exe = _resolve_cursor_exe()
         # Windows: 使用列表形式传入，避免路径含空格等问题
         subprocess.Popen(
@@ -100,8 +126,8 @@ def open_cursor(folder_path: str) -> dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
-def _find_cursor_window():
-    """查找 Cursor 主窗口（UIA）。优先匹配“上次打开的文件夹名”在标题中的窗口。"""
+def _find_cursor_window(project_id: Optional[str] = None):
+    """查找 Cursor 主窗口（UIA）。project_id 为空则用“上次打开的文件夹名”；否则用 projectId 映射表中的文件夹名优先匹配对应窗口。"""
     if not _pywinauto_ok:
         logger.warning("pywinauto 未安装，无法查找 Cursor 窗口")
         return None
@@ -112,16 +138,18 @@ def _find_cursor_window():
         logger.error("导入 pywinauto 失败: %s", e)
         return None
 
-    # 1) 枚举标题含 Cursor 的顶层窗口，若有“上次打开的文件夹名”则优先选标题含该名的
+    preferred_folder = (_project_windows.get(project_id) if project_id else None) or _last_opened_folder_name
+
+    # 1) 枚举标题含 Cursor 的顶层窗口，若有 preferred_folder 则优先选标题含该名的
     try:
         desktop = Desktop(backend="uia")
         cursor_windows = desktop.windows(title_re=".*Cursor.*")
-        if cursor_windows and _last_opened_folder_name:
+        if cursor_windows and preferred_folder:
             for wnd in cursor_windows:
                 try:
                     title = wnd.window_text() or ""
-                    if _last_opened_folder_name in title:
-                        logger.info("按标题匹配到上次打开的窗口: %s", title[:80])
+                    if preferred_folder in title:
+                        logger.info("按标题匹配到窗口(project_id=%s): %s", project_id, title[:80])
                         return wnd
                 except Exception:
                     continue
@@ -137,7 +165,7 @@ def _find_cursor_window():
         app = Application(backend="uia").connect(title_re=".*Cursor.*", timeout=config.CURSOR_UI_TIMEOUT)
         try:
             wnd = app.window(title_re=".*Cursor.*")
-            if _last_opened_folder_name and wnd.window_text() and _last_opened_folder_name not in wnd.window_text():
+            if preferred_folder and wnd.window_text() and preferred_folder not in wnd.window_text():
                 logger.info("当前连接到的 Cursor 窗口标题: %s", (wnd.window_text() or "")[:80])
             return wnd
         except Exception:
@@ -157,17 +185,73 @@ def _find_cursor_window():
     return None
 
 
-def get_input_state() -> dict[str, Any]:
+def _parse_hotkey(hotkey_str: str) -> list[str]:
+    """将配置中的热键字符串（如 'Ctrl+L'、'Ctrl+Shift+I'）解析为 pyautogui.hotkey 的参数列表。"""
+    if not hotkey_str or not hotkey_str.strip():
+        return []
+    parts = [p.strip() for p in hotkey_str.split("+") if p.strip()]
+    if not parts:
+        return []
+    key_map = {
+        "ctrl": "ctrl", "control": "ctrl",
+        "alt": "alt",
+        "shift": "shift",
+        "win": "win", "windows": "win", "meta": "win", "cmd": "command",
+        "command": "command",
+    }
+    modifiers = []
+    main_key = None
+    for p in parts:
+        lower = p.lower()
+        if lower in key_map:
+            mod = key_map[lower]
+            if mod != "command" or sys.platform != "win32":
+                modifiers.append(mod if mod != "command" else "ctrl")
+            else:
+                modifiers.append("ctrl")
+        else:
+            main_key = (p.lower() if len(p) == 1 else lower)
+            break
+    if main_key is None and parts:
+        main_key = parts[-1].lower() if len(parts[-1]) > 1 else parts[-1].lower()
+    if main_key is None:
+        return []
+    return [*modifiers, main_key]
+
+
+def open_new_agent(project_id: Optional[str] = None) -> dict[str, Any]:
+    """
+    打开新的 Agent（Chat/Composer）：先聚焦对应 projectId 的 Cursor 窗口，再发送配置的热键。
+    热键由 config.CURSOR_OPEN_AGENT_HOTKEY 配置，默认 Ctrl+Shift+L。
+    """
+    if not _pyautogui_ok:
+        return {"ok": False, "error": "需要 pyautogui 才能发送热键"}
+    keys = _parse_hotkey(config.CURSOR_OPEN_AGENT_HOTKEY)
+    if not keys:
+        return {"ok": False, "error": f"无效的热键配置: {config.CURSOR_OPEN_AGENT_HOTKEY}"}
+    try:
+        if _pywinauto_ok:
+            wnd = _find_cursor_window(project_id)
+            if wnd:
+                wnd.set_focus()
+                time.sleep(0.2)
+        pyautogui.hotkey(*keys)
+        return {"ok": True, "hotkey": config.CURSOR_OPEN_AGENT_HOTKEY}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def get_input_state(project_id: Optional[str] = None) -> dict[str, Any]:
     """
     监控当前输入框状态（Chat/Composer 输入区）。
-    优先用 UIA 查找编辑框，失败则用备用逻辑（需先聚焦到输入框）。
+    project_id 指定时在对应工程窗口内查找；否则用上次打开的窗口。
     """
     out = {"ok": False, "text": "", "focused": False, "method": "none"}
     if not _pywinauto_ok:
         out["error"] = "未安装 pywinauto"
         return out
     try:
-        wnd = _find_cursor_window()
+        wnd = _find_cursor_window(project_id)
         if not wnd:
             logger.warning("get_input_state: 未找到 Cursor 窗口")
             out["error"] = "未找到 Cursor 窗口或超时"
@@ -238,10 +322,75 @@ def _paste_text_via_clipboard(text: str) -> bool:
         return False
 
 
-def write_and_send(text: str) -> dict[str, Any]:
+def _dump_send_candidates(wnd) -> None:
+    """调试用：把窗口中所有可点击的 Button/Hyperlink/Image 的 name、automation_id 打到日志，便于在 Cursor 里找到发送按钮。"""
+    if not _pywinauto_ok:
+        return
+    want_types = ("Button", "Hyperlink", "Image")
+    try:
+        candidates = []
+        for ctrl in wnd.descendants():
+            try:
+                ct = getattr(ctrl.element_info, "control_type", None)
+                if ct not in want_types:
+                    continue
+                name = (getattr(ctrl.element_info, "name", None) or "") or ""
+                auto_id = (getattr(ctrl.element_info, "automation_id", None) or "") or ""
+                rect = getattr(ctrl.element_info, "rectangle", None)
+                candidates.append((ct, name, auto_id, rect))
+            except Exception:
+                continue
+        if candidates:
+            logger.info("发送按钮候选控件（共 %d 个，便于在 Cursor 中确认发送按钮）:", len(candidates))
+            for i, (ct, name, auto_id, rect) in enumerate(candidates[:30]):
+                logger.info("  [%d] type=%s name=%r automation_id=%r rect=%s", i, ct, name or None, auto_id or None, rect)
+            if len(candidates) > 30:
+                logger.info("  ... 还有 %d 个未列出", len(candidates) - 30)
+    except Exception as e:
+        logger.debug("dump 候选控件失败: %s", e)
+
+
+def _find_and_click_send_button(wnd) -> bool:
+    """
+    在 Cursor 窗口内查找“发送”按钮并点击。
+    匹配 Button/Hyperlink/Image 的 name 或 automation_id 包含 send、submit、提交、发送、arrow 等。
+    返回是否找到并点击成功。未找到时会 dump 候选控件到日志便于调试。
+    """
+    if not _pywinauto_ok:
+        return False
+    keywords = ("send", "submit", "提交", "发送", "arrow", "composer", "chat")
+    exclude = ("new", "create", "newchat", "新对话", "clear", "stop", "cancel")
+    # Cursor 可能是 Button，也可能是 Hyperlink/Image（图标按钮）
+    want_types = ("Button", "Hyperlink", "Image")
+    try:
+        for ctrl in wnd.descendants():
+            try:
+                ct = ctrl.element_info.control_type
+                if ct not in want_types:
+                    continue
+                name = (getattr(ctrl.element_info, "name", None) or "") or ""
+                auto_id = (getattr(ctrl.element_info, "automation_id", None) or "") or ""
+                combined = (name + " " + auto_id).lower()
+                if any(n in combined for n in exclude):
+                    continue
+                if any(kw in combined for kw in keywords):
+                    ctrl.click()
+                    logger.info("已点击发送按钮: type=%s name=%r automation_id=%r", ct, name or None, auto_id or None)
+                    return True
+            except Exception:
+                continue
+        # 未找到时输出候选，方便在 Cursor 里对照界面确认发送按钮的 name/automation_id
+        _dump_send_candidates(wnd)
+        return False
+    except Exception as e:
+        logger.debug("查找发送按钮失败: %s", e)
+        return False
+
+
+def write_and_send(text: str, project_id: Optional[str] = None) -> dict[str, Any]:
     """
     往输入框写入内容并发送。
-    中文等 Unicode 通过剪贴板 Ctrl+V 粘贴；发送优先 Enter，可选 Ctrl+Enter（见配置）。
+    project_id 指定时在对应工程窗口内操作；否则用上次打开的窗口。
     """
     if not text:
         return {"ok": False, "error": "内容为空"}
@@ -249,10 +398,12 @@ def write_and_send(text: str) -> dict[str, Any]:
         return {"ok": False, "error": "需要 pywinauto 或 pyautogui"}
     # 是否包含非 ASCII（如中文）→ 必须用剪贴板粘贴
     use_clipboard = any(ord(c) > 127 for c in text)
-    send_hotkey = config.CURSOR_SEND_HOTKEY  # "Enter" 或 "Ctrl+Enter"
+    send_keys = _parse_hotkey(config.CURSOR_SEND_HOTKEY)  # 如 ["ctrl", "shift", "enter"]
+    if not send_keys:
+        return {"ok": False, "error": f"无效的发送热键配置: {config.CURSOR_SEND_HOTKEY}"}
     try:
         if _pywinauto_ok:
-            wnd = _find_cursor_window()
+            wnd = _find_cursor_window(project_id)
             if wnd:
                 for ctrl in wnd.descendants():
                     try:
@@ -269,12 +420,24 @@ def write_and_send(text: str) -> dict[str, Any]:
                                 ctrl.set_edit_text(text)
                             else:
                                 ctrl.type_keys(text.replace("}", "}}").replace("{", "{{"), with_spaces=True)
-                        time.sleep(0.2)
-                        # 发送：Enter 或 Ctrl+Enter（Cursor  composer 常用 Ctrl+Enter）
-                        if send_hotkey == "Ctrl+Enter":
-                            ctrl.type_keys("^{Enter}")
+                        # 等待内容落盘后，确保输入框保持焦点，再用 Ctrl+Shift+Enter 发送
+                        time.sleep(0.4)
+                        wnd.set_focus()
+                        time.sleep(0.15)
+                        ctrl.set_focus()
+                        time.sleep(0.25)  # 留足时间让焦点稳定到输入框，否则热键可能被其它控件吃掉
+                        logger.info("write_and_send: 即将发送热键 %s -> %s", config.CURSOR_SEND_HOTKEY, send_keys)
+                        if _pyautogui_ok:
+                            pyautogui.hotkey(*send_keys)
                         else:
-                            ctrl.type_keys("{Enter}")
+                            # pywinauto type_keys：^=Ctrl +=Shift，主键用 {Enter} 等
+                            mod_map = {"ctrl": "^", "shift": "+", "alt": "%", "win": "win"}
+                            prefix = "".join(mod_map.get(k, "") for k in send_keys[:-1] if k in mod_map)
+                            main = send_keys[-1]
+                            key_str = prefix + (main if len(main) > 1 else main.upper())
+                            if main in ("enter", "return", "tab", "space", "escape"):
+                                key_str = prefix + "{" + main.capitalize() + "}"
+                            ctrl.type_keys(key_str)
                         return {"ok": True, "method": "uia"}
                     except Exception:
                         continue
@@ -283,96 +446,19 @@ def write_and_send(text: str) -> dict[str, Any]:
                 pyautogui.hotkey("ctrl", "a")
                 time.sleep(0.05)
                 _paste_text_via_clipboard(text)
+                time.sleep(0.15)
             else:
                 pyautogui.hotkey("ctrl", "a")
                 time.sleep(0.05)
                 pyautogui.write(text, interval=0.02)
-            time.sleep(0.15)
-            if send_hotkey == "Ctrl+Enter":
-                pyautogui.hotkey("ctrl", "enter")
-            else:
-                pyautogui.press("enter")
+            time.sleep(0.4)
+            # 统一用配置的热键发送（Cursor 默认 Ctrl+Shift+Enter），稍等确保焦点在输入区
+            time.sleep(0.2)
+            logger.info("write_and_send: 即将发送热键 %s -> %s (method=keyboard)", config.CURSOR_SEND_HOTKEY, send_keys)
+            pyautogui.hotkey(*send_keys)
             return {"ok": True, "method": "keyboard"}
         return {"ok": False, "error": "无法写入输入框（UIA 未找到控件且未使用键盘备用）"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
-def _get_control_text(ctrl) -> str:
-    """从控件取文本（window_text / get_value）。"""
-    try:
-        if hasattr(ctrl, "get_value"):
-            v = ctrl.get_value()
-            if v is not None and isinstance(v, str):
-                return v
-        if hasattr(ctrl, "window_text"):
-            t = ctrl.window_text()
-            if t is not None and isinstance(t, str):
-                return t
-    except Exception:
-        pass
-    return ""
-
-
-def get_result() -> dict[str, Any]:
-    """
-    监控最后一条结果（AI 回复区域文本）。
-    收集所有子控件中的文本，取最长的一段或合并多段作为结果；长度阈值放宽以便 Electron 多段文本也能命中。
-    """
-    out = {"ok": False, "text": "", "method": "none"}
-    if not _pywinauto_ok:
-        out["error"] = "未安装 pywinauto"
-        return out
-    try:
-        wnd = _find_cursor_window()
-        if not wnd:
-            out["error"] = "未找到 Cursor 窗口"
-            return out
-        # 收集所有非空文本（长度 > 0），记录 (长度, 文本, 控件类型) 便于优先选 Document/Edit
-        candidates = []
-        text_by_type = []
-        for ctrl in wnd.descendants():
-            try:
-                t = _get_control_text(ctrl)
-                if not t or not t.strip():
-                    continue
-                ctrl_type = getattr(ctrl.element_info, "control_type", None)
-                name = getattr(ctrl.element_info, "name", "") or ""
-                auto_id = getattr(ctrl.element_info, "automation_id", "") or ""
-                candidates.append((len(t), t.strip(), ctrl_type))
-                # 便于调试：记录有内容的控件类型
-                if len(t) >= 10:
-                    text_by_type.append((ctrl_type, len(t), name[:30], auto_id[:30]))
-            except Exception:
-                continue
-        if not candidates:
-            logger.warning("get_result: 未找到任何有文本的控件；请确认 Cursor 已显示 AI 回复")
-            out["error"] = "未找到任何结果文本区域"
-            return out
-        # 优先取最长的一段（通常为 AI 回复区）
-        candidates.sort(key=lambda x: -x[0])
-        best_len, best_text, _ = candidates[0]
-        # 若最长一段仍较短，尝试合并多段（AI 回复可能被拆成多个 Text 控件）
-        if best_len < 100 and len(candidates) > 1:
-            # 按长度降序取前几段，用换行拼接，过滤掉过短且像 UI 文字的
-            parts = []
-            seen = set()
-            for _, t, _ in candidates[:20]:
-                if len(t) < 5 or t in seen:
-                    continue
-                seen.add(t)
-                parts.append(t)
-            if parts:
-                combined = "\n\n".join(parts)[:12000]
-                if len(combined) > best_len:
-                    best_text = combined
-                    best_len = len(combined)
-        out["ok"] = True
-        out["text"] = (best_text or "")[:12000]
-        out["method"] = "uia"
-        if best_len < 50:
-            logger.info("get_result: 仅找到较短文本（%s 字），可能并非完整回复", best_len)
-        return out
-    except Exception as e:
-        out["error"] = str(e)
-        return out
